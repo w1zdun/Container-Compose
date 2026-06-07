@@ -24,6 +24,7 @@
 import ArgumentParser
 import ContainerCommands
 import ContainerAPIClient
+import ContainerPersistence
 import Foundation
 import Yams
 
@@ -83,6 +84,8 @@ public struct ComposeDown: AsyncParsableCommand {
     private var fileManager: FileManager { FileManager.default }
     private var projectName: String?
     private var environmentVariables: [String: String] = [:]
+    private var dnsZoneDomain: String?  // global DNS domain when zone mode is active (nil = classic naming)
+    private var serviceZones: [String: String] = [:]  // service name -> per-network DNS zone label
 
     public mutating func run() async throws {
 
@@ -119,6 +122,24 @@ public struct ComposeDown: AsyncParsableCommand {
             services = services.filter({ serviceName, _ in
                 self.services.contains(serviceName)
             })
+        }
+
+        // Reconstruct the same DNS zones `up` used, so the container names match.
+        // `down` does not remove networks, so their subnets are still queryable;
+        // if a network was deleted out of band the zone falls back to the
+        // project slug and the original container may not be found (orphan).
+        dnsZoneDomain = DefaultsStore.getOptional(key: .defaultDNSDomain).flatMap { $0.isEmpty ? nil : $0 }
+        if dnsZoneDomain != nil {
+            var networkZones: [String: String] = [:]
+            for (networkName, networkConfig) in dockerCompose.networks ?? [:] {
+                let actualNetworkName = networkConfig?.name ?? networkName
+                if let zone = await networkZoneLabel(actualName: actualNetworkName, composeSubnet: networkConfig?.ipv4Subnet) {
+                    networkZones[actualNetworkName] = zone
+                }
+            }
+            serviceZones = buildServiceZones(
+                services: services, networkZones: networkZones, networks: dockerCompose.networks,
+                projectName: projectName ?? "", envVars: environmentVariables)
         }
 
         // Removing a volume fails while a container still references it, so
@@ -177,9 +198,11 @@ public struct ComposeDown: AsyncParsableCommand {
         guard let projectName else { return }
 
         for (serviceName, service) in services {
-            // Respect explicit container_name (with variable interpolation), otherwise use default pattern
+            // Respect explicit container_name (with variable interpolation), otherwise use default pattern.
+            // Zoned FQDN when a DNS domain is configured (matches `up`).
             let containerName = resolveContainerName(
-                explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: environmentVariables)
+                explicit: service.container_name, projectName: projectName, serviceName: serviceName,
+                zone: serviceZones[serviceName], dnsDomain: dnsZoneDomain, envVars: environmentVariables)
 
             print("Stopping container: \(containerName)")
             
