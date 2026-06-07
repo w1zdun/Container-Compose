@@ -25,6 +25,8 @@ import Foundation
 import Yams
 import Rainbow
 import ContainerCommands
+import ContainerAPIClient
+import ContainerResource
 
 public func resolvedPath(for path: String, relativeTo baseURL: URL) -> String {
     let expandedPath = NSString(string: path).expandingTildeInPath
@@ -142,14 +144,115 @@ public func resolveProjectName(
     return deriveProjectName(cwd: cwd)
 }
 
-/// Resolves the container name for a service. An explicit `container_name`
-/// (with variable interpolation, e.g. `${NAME:-fallback}`) takes precedence;
-/// otherwise the default `<projectName>-<serviceName>` pattern is used.
-func resolveContainerName(explicit: String?, projectName: String, serviceName: String, envVars: [String: String] = [:]) -> String {
-    if let explicit {
-        return resolveVariable(explicit, with: envVars)
+/// Maximum length of a single DNS label (RFC 1035). apple/container validates
+/// this only at query time, not at container creation, so an over-long label
+/// produces a container that exists but fails to resolve — we warn up front.
+let maxDNSLabelLength = 63
+/// Maximum total length of a DNS name in wire form (RFC 1035).
+let maxDNSNameLength = 253
+/// Soft cap on apple/container entity names — see [[apple-container-limitations]].
+let maxContainerNameLength = 64
+
+/// Derives a per-network DNS zone label from an IPv4 subnet/CIDR by dropping the
+/// mask and replacing dots with dashes (`"10.99.5.0/24"` -> `"10-99-5-0"`). The
+/// full network address is globally unique on the host, so the label never
+/// collides between distinct networks. Returns `nil` for empty input, IPv6
+/// (contains `:`), or anything that is not a dotted-quad IPv4 address — callers
+/// fall back to a project slug.
+func zoneLabel(fromSubnet subnet: String) -> String? {
+    let address = subnet.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+    guard !address.isEmpty, !address.contains(":") else { return nil }
+    let octets = address.split(separator: ".", omittingEmptySubsequences: false)
+    guard octets.count == 4,
+        octets.allSatisfy({ octet in
+            !octet.isEmpty && octet.count <= 3 && octet.allSatisfy(\.isNumber)
+                && (UInt(octet).map { $0 <= 255 } ?? false)
+        })
+    else { return nil }
+    return address.replacingOccurrences(of: ".", with: "-")
+}
+
+/// Sanitizes a project name into a DNS-safe zone label used as the fallback when
+/// a network's IPv4 subnet can't be determined: lowercase, every character
+/// outside `[a-z0-9-]` collapsed to a single `-`, leading/trailing dashes
+/// stripped, truncated to one DNS label. Empty results become a deterministic
+/// placeholder. Underscores (legal in `container` names but not in RFC
+/// hostnames) and other characters are normalized here. Two long project names
+/// can collide after truncation — fallback territory only; an explicit
+/// `subnet:` gives a stable, collision-free CIDR zone instead.
+func slugifyZone(_ name: String) -> String {
+    var slug = ""
+    var pendingDash = false
+    for character in name.lowercased() {
+        if character.isASCII, character.isLetter || character.isNumber {
+            if pendingDash, !slug.isEmpty { slug.append("-") }
+            slug.append(character)
+            pendingDash = false
+        } else {
+            pendingDash = true
+        }
     }
-    return "\(projectName)-\(serviceName)"
+    if slug.count > maxDNSLabelLength {
+        slug = String(slug.prefix(maxDNSLabelLength))
+        while slug.hasSuffix("-") { slug.removeLast() }
+    }
+    return slug.isEmpty ? "proj" : slug
+}
+
+/// Collapses dots in a single name label to dashes so a service/`container_name`
+/// containing a dot (e.g. `api.internal`) stays one DNS label when composed into
+/// a zoned FQDN, instead of silently becoming an extra subdomain level.
+func sanitizeNameLabel(_ label: String) -> String {
+    label.replacingOccurrences(of: ".", with: "-")
+}
+
+/// Returns human-readable warnings if a composed container/DNS name would fail
+/// (or be rejected). Empty when the name is valid. Separated from
+/// `resolveContainerName` so it is unit-testable without capturing stdout.
+func dnsNameWarnings(for name: String) -> [String] {
+    var warnings: [String] = []
+    for label in name.split(separator: ".", omittingEmptySubsequences: false) where label.utf8.count > maxDNSLabelLength {
+        warnings.append(
+            "DNS label '\(label)' in '\(name)' exceeds \(maxDNSLabelLength) bytes; DNS resolution will fail (RFC 1035).")
+    }
+    if name.utf8.count > maxDNSNameLength {
+        warnings.append("DNS name '\(name)' exceeds \(maxDNSNameLength) bytes; DNS resolution will fail.")
+    }
+    if name.count > maxContainerNameLength {
+        warnings.append("container name '\(name)' exceeds \(maxContainerNameLength) characters; the runtime may reject it.")
+    }
+    return warnings
+}
+
+/// Resolves the container name for a service. An explicit `container_name`
+/// (with variable interpolation, e.g. `${NAME:-fallback}`) takes precedence.
+///
+/// When both `zone` and `dnsDomain` are non-empty (zone mode), the name is the
+/// per-project FQDN `<base>.<zone>.<dnsDomain>` — `base` is the interpolated
+/// `container_name` or, lacking one, the bare `serviceName` (the project is
+/// encoded in the zone, so the `<projectName>-` prefix is dropped). The runtime
+/// registers a dotted name verbatim as an FQDN, which is what makes the same
+/// service name reachable in parallel projects. Otherwise the classic
+/// `<projectName>-<serviceName>` (or verbatim explicit) name is returned.
+func resolveContainerName(
+    explicit: String?,
+    projectName: String,
+    serviceName: String,
+    zone: String? = nil,
+    dnsDomain: String? = nil,
+    envVars: [String: String] = [:]
+) -> String {
+    let zoneMode = !(zone ?? "").isEmpty && !(dnsDomain ?? "").isEmpty
+    let base: String
+    if let explicit {
+        base = resolveVariable(explicit, with: envVars)
+    } else {
+        base = zoneMode ? serviceName : "\(projectName)-\(serviceName)"
+    }
+    guard zoneMode, let zone, let dnsDomain else { return base }
+    let name = "\(sanitizeNameLabel(base)).\(zone).\(dnsDomain)"
+    for warning in dnsNameWarnings(for: name) { print("Warning: \(warning)") }
+    return name
 }
 
 /// Splits a shell-style command string into arguments: whitespace separation,
@@ -203,22 +306,89 @@ func shellLex(_ input: String) -> [String] {
     return args
 }
 
-/// Builds a service-name -> DNS host mapping (`<containerName>.<domain>`) for
-/// the given services, used to resolve inter-service references in environment
-/// values when the 'container' tool has a local DNS domain configured.
+/// Builds a service-name -> DNS host mapping for the given services, used to
+/// resolve inter-service references in environment values when the 'container'
+/// tool has a local DNS domain configured.
+///
+/// When a service has a zone label in `serviceZones`, its host is the zoned
+/// FQDN (`<base>.<zone>.<domain>`) — already fully qualified, so the domain is
+/// not appended a second time. Without a zone the classic
+/// `<containerName>.<domain>` form is used.
 func buildServiceHosts(
     services: [(serviceName: String, service: Service)],
     projectName: String,
     dnsDomain: String,
+    serviceZones: [String: String] = [:],
     envVars: [String: String] = [:]
 ) -> [String: String] {
     var hosts: [String: String] = [:]
     for (serviceName, service) in services {
-        let containerName = resolveContainerName(
-            explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: envVars)
-        hosts[serviceName] = "\(containerName).\(dnsDomain)"
+        if let zone = serviceZones[serviceName], !zone.isEmpty {
+            hosts[serviceName] = resolveContainerName(
+                explicit: service.container_name, projectName: projectName, serviceName: serviceName,
+                zone: zone, dnsDomain: dnsDomain, envVars: envVars)
+        } else {
+            let containerName = resolveContainerName(
+                explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: envVars)
+            hosts[serviceName] = "\(containerName).\(dnsDomain)"
+        }
     }
     return hosts
+}
+
+/// Extracts the IPv4 subnet (CIDR string, e.g. "10.99.5.0/24") from a network's
+/// runtime state — authoritative for both explicit and vmnet-auto-allocated
+/// subnets.
+func ipv4Subnet(from state: NetworkState) -> String? {
+    switch state {
+    case .running(_, let status):
+        return status.ipv4Subnet.description
+    case .created(let config):
+        return config.ipv4Subnet?.description
+    }
+}
+
+/// Resolves the DNS zone label for a top-level network: the real allocated IPv4
+/// subnet if the network exists, else the compose-declared subnet. Returns `nil`
+/// when neither yields a usable IPv4 CIDR (caller falls back to the project
+/// slug). Shared by `up` and `down` so both compute identical names.
+func networkZoneLabel(actualName: String, composeSubnet: String?) async -> String? {
+    if let state = try? await NetworkClient().get(id: actualName),
+        let subnet = ipv4Subnet(from: state),
+        let label = zoneLabel(fromSubnet: subnet) {
+        return label
+    }
+    if let composeSubnet, let label = zoneLabel(fromSubnet: composeSubnet) {
+        return label
+    }
+    return nil
+}
+
+/// Maps each service to its DNS zone label, taken from its first network's CIDR
+/// (via `networkZones`). A service with no `networks:` — or one resolved to the
+/// shared builtin default network, whose CIDR is common to every project — gets
+/// the project slug instead: a CIDR zone there would collide across projects and
+/// regress today's `<project>-<service>` coexistence. Pure (no I/O) so the
+/// per-project isolation contract is unit-testable; `up` and `down` share it.
+func buildServiceZones(
+    services: [(serviceName: String, service: Service)],
+    networkZones: [String: String],
+    networks: [String: Network?]?,
+    projectName: String,
+    envVars: [String: String] = [:]
+) -> [String: String] {
+    let slug = slugifyZone(projectName)
+    var zones: [String: String] = [:]
+    for (serviceName, service) in services {
+        guard let first = service.networks?.first else {
+            zones[serviceName] = slug
+            continue
+        }
+        let resolved = resolveVariable(first, with: envVars)
+        let actualNetworkName = networks?[first]??.name ?? resolved
+        zones[serviceName] = networkZones[actualNetworkName] ?? slug
+    }
+    return zones
 }
 
 /// Converts Docker Compose port specification into a container run -p format.

@@ -110,6 +110,139 @@ struct HelperFunctionsTests {
         #expect(hosts["worker"] == "worker-dev.dev")
     }
 
+    // MARK: - DNS per-project subzones
+
+    @Test("Zone label from CIDR drops mask and dashes the address")
+    func testZoneLabelFromCIDR() throws {
+        #expect(zoneLabel(fromSubnet: "10.99.5.0/24") == "10-99-5-0")
+        #expect(zoneLabel(fromSubnet: "172.28.0.0/16") == "172-28-0-0")
+    }
+
+    @Test("Zone label from a bare address (no mask)")
+    func testZoneLabelFromAddress() throws {
+        #expect(zoneLabel(fromSubnet: "10.99.5.0") == "10-99-5-0")
+    }
+
+    @Test("Zone label rejects empty, IPv6, and non-IPv4 input")
+    func testZoneLabelInvalid() throws {
+        #expect(zoneLabel(fromSubnet: "") == nil)
+        #expect(zoneLabel(fromSubnet: "fd00::/64") == nil)
+        #expect(zoneLabel(fromSubnet: "not-a-subnet") == nil)
+        #expect(zoneLabel(fromSubnet: "10.99.5") == nil)  // too few octets
+        #expect(zoneLabel(fromSubnet: "999.1.1.1/24") == nil)  // octet out of range
+    }
+
+    @Test("slugifyZone sanitizes underscores, slashes, dots, spaces and case")
+    func testSlugifyZone() throws {
+        #expect(slugifyZone("sez_xxx") == "sez-xxx")
+        #expect(slugifyZone("Feat/My Branch.1") == "feat-my-branch-1")
+        #expect(slugifyZone("") == "proj")
+        #expect(slugifyZone("***") == "proj")
+        // Truncated to a single DNS label (<= 63 bytes), no trailing dash.
+        let long = slugifyZone(String(repeating: "a", count: 80))
+        #expect(long.count == 63)
+        #expect(!long.hasSuffix("-"))
+    }
+
+    @Test("sanitizeNameLabel collapses dots to dashes (keeps one DNS label)")
+    func testSanitizeNameLabel() throws {
+        #expect(sanitizeNameLabel("api.internal") == "api-internal")
+        #expect(sanitizeNameLabel("db") == "db")
+    }
+
+    @Test("dnsNameWarnings flags an over-long label, passes a valid name")
+    func testDNSNameWarnings() throws {
+        #expect(dnsNameWarnings(for: "db.10-99-5-0.test").isEmpty)
+        let overLong = "\(String(repeating: "a", count: 64)).10-99-5-0.test"
+        #expect(!dnsNameWarnings(for: overLong).isEmpty)
+    }
+
+    @Test("Zoned container name is a per-project FQDN")
+    func testResolveContainerNameZonedDefault() throws {
+        let result = resolveContainerName(
+            explicit: nil, projectName: "myproj", serviceName: "db", zone: "10-99-5-0", dnsDomain: "test")
+        // Project is encoded in the zone, so the <project>- prefix is dropped.
+        #expect(result == "db.10-99-5-0.test")
+    }
+
+    @Test("Zoned container name pulls explicit container_name into the zone")
+    func testResolveContainerNameZonedExplicit() throws {
+        let result = resolveContainerName(
+            explicit: "my-web", projectName: "myproj", serviceName: "web", zone: "10-99-5-0", dnsDomain: "test")
+        #expect(result == "my-web.10-99-5-0.test")
+    }
+
+    @Test("Same service in different zones yields distinct, unique FQDNs (project isolation)")
+    func testResolveContainerNameZonedIsolation() throws {
+        let a = resolveContainerName(
+            explicit: nil, projectName: "projA", serviceName: "db", zone: "10-99-5-0", dnsDomain: "test")
+        let b = resolveContainerName(
+            explicit: nil, projectName: "projB", serviceName: "db", zone: "10-99-6-0", dnsDomain: "test")
+        #expect(a == "db.10-99-5-0.test")
+        #expect(b == "db.10-99-6-0.test")
+        #expect(a != b)
+    }
+
+    @Test("Zoned base with a dot stays a single label")
+    func testResolveContainerNameZonedDotInBase() throws {
+        let result = resolveContainerName(
+            explicit: "api.internal", projectName: "myproj", serviceName: "api", zone: "10-99-5-0", dnsDomain: "test")
+        #expect(result == "api-internal.10-99-5-0.test")
+    }
+
+    @Test("Without zone/domain the classic naming is unchanged")
+    func testResolveContainerNameNoZoneUnchanged() throws {
+        #expect(
+            resolveContainerName(explicit: nil, projectName: "myproj", serviceName: "web") == "myproj-web")
+        #expect(
+            resolveContainerName(explicit: "my-web", projectName: "myproj", serviceName: "web") == "my-web")
+        // An empty zone disables zone mode too.
+        #expect(
+            resolveContainerName(
+                explicit: nil, projectName: "myproj", serviceName: "web", zone: "", dnsDomain: "test") == "myproj-web")
+    }
+
+    @Test("Service hosts in zone mode are zoned FQDNs (domain not doubled)")
+    func testBuildServiceHostsZoned() throws {
+        let services: [(serviceName: String, service: Service)] = [
+            ("db", Service(image: "mysql:8")),
+            ("web", Service(image: "nginx", container_name: "my-web")),
+        ]
+        let hosts = buildServiceHosts(
+            services: services, projectName: "myproj", dnsDomain: "test",
+            serviceZones: ["db": "10-99-5-0", "web": "10-99-5-0"])
+        #expect(hosts["db"] == "db.10-99-5-0.test")
+        #expect(hosts["web"] == "my-web.10-99-5-0.test")
+    }
+
+    @Test("Services without networks fall back to the project slug (default-network isolation)")
+    func testBuildServiceZonesDefaultNetworkSlug() throws {
+        let services: [(serviceName: String, service: Service)] = [
+            ("db", Service(image: "mysql")),
+            ("app", Service(image: "nginx")),
+        ]
+        let zonesA = buildServiceZones(services: services, networkZones: [:], networks: nil, projectName: "sez_xxx")
+        let zonesB = buildServiceZones(services: services, networkZones: [:], networks: nil, projectName: "sez_yyy")
+        #expect(zonesA["db"] == "sez-xxx")
+        #expect(zonesA["app"] == "sez-xxx")
+        // Regression: two projects sharing the builtin default network stay isolated
+        // (would otherwise collide on db.<defaultzone>.test).
+        #expect(zonesA["db"] != zonesB["db"])
+    }
+
+    @Test("Service zone uses its first network's CIDR label when known")
+    func testBuildServiceZonesExplicitNetwork() throws {
+        let services: [(serviceName: String, service: Service)] = [
+            ("db", Service(image: "mysql", networks: ["backend"])),
+            ("cache", Service(image: "redis", networks: ["frontend"])),
+        ]
+        let zones = buildServiceZones(
+            services: services, networkZones: ["backend": "10-99-5-0"], networks: nil, projectName: "myproj")
+        #expect(zones["db"] == "10-99-5-0")
+        // A network with no resolvable zone falls back to the project slug.
+        #expect(zones["cache"] == "myproj")
+    }
+
     @Test("Service environment value with variable default is interpolated")
     func testServiceEnvDefaultInterpolated() throws {
         // Regression: SERVICE_ID=${SERVICE_ID:-12345} reached

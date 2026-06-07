@@ -26,6 +26,7 @@ import ContainerCommands
 //import ContainerClient
 import ContainerAPIClient
 import ContainerPersistence
+import ContainerResource
 import ContainerizationExtras
 import Foundation
 @preconcurrency import Rainbow
@@ -106,6 +107,8 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var freshlyCreatedVolumes: Set<String> = []  // native names created by this run, pending population
     private var containerNames: [String: String] = [:]  // service name -> resolved container name
     private var serviceHosts: [String: String] = [:]  // service name -> container DNS name (when a DNS domain is configured)
+    private var dnsZoneDomain: String?  // global DNS domain when zone mode is active (nil = classic naming)
+    private var serviceZones: [String: String] = [:]  // service name -> per-network DNS zone label (CIDR-derived or project slug)
     private var containerIps: [String: String] = [:]
     private var containerConsoleColors: [String: NamedColor] = [:]
 
@@ -148,18 +151,48 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             "Note: The project name currently only affects container naming (e.g., '\(resolvedProjectName)-serviceName'). Full project-level isolation for other resources (networks, implicit volumes) is not implemented by this tool."
         )
 
-        // Get Services to use
-        var services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose.services))
+        // Get Services to use. Keep the full, unfiltered list for DNS host/zone
+        // resolution so environment references to services not (re)started by
+        // this invocation still resolve.
+        let allServices = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose.services))
+        var services = allServices
 
         // Prefer DNS-based service resolution when the 'container' tool has a
         // local DNS domain configured (container system dns create <domain> +
         // container system property set dns.domain <domain>). DNS names are
         // stable across restarts, unlike container IPs, and resolve even for
         // services not (re)started by this invocation.
-        if let dnsDomain = DefaultsStore.getOptional(key: .defaultDNSDomain), !dnsDomain.isEmpty {
+        dnsZoneDomain = DefaultsStore.getOptional(key: .defaultDNSDomain).flatMap { $0.isEmpty ? nil : $0 }
+
+        // Process top-level networks FIRST: in zone mode the per-project DNS
+        // zone is derived from each network's IPv4 subnet, which is only known
+        // once the network exists (vmnet may auto-allocate it). This also moves
+        // network creation ahead of `stopOldStuff`, so the names it computes
+        // match the zoned names used to start the containers.
+        var networkZones: [String: String] = [:]  // actual network name -> zone label
+        if let networks = dockerCompose.networks {
+            print("\n--- Processing Networks ---")
+            for (networkName, networkConfig) in networks {
+                try await setupNetwork(name: networkName, config: networkConfig)
+                if dnsZoneDomain != nil {
+                    let actualNetworkName = networkConfig?.name ?? networkName
+                    if let zone = await networkZoneLabel(actualName: actualNetworkName, composeSubnet: networkConfig?.ipv4Subnet) {
+                        networkZones[actualNetworkName] = zone
+                    }
+                }
+            }
+            print("--- Networks Processed ---\n")
+        }
+
+        if let dnsDomain = dnsZoneDomain {
+            serviceZones = buildServiceZones(
+                services: allServices, networkZones: networkZones, networks: dockerCompose.networks,
+                projectName: projectName ?? "", envVars: environmentVariables)
             serviceHosts = buildServiceHosts(
-                services: services, projectName: projectName ?? "", dnsDomain: dnsDomain, envVars: environmentVariables)
-            print("Info: Local DNS domain '\(dnsDomain)' configured. Service references in environment values resolve to container DNS names.")
+                services: allServices, projectName: projectName ?? "", dnsDomain: dnsDomain,
+                serviceZones: serviceZones, envVars: environmentVariables)
+            print("Info: Local DNS domain '\(dnsDomain)' configured. Services resolve as per-project FQDNs (e.g. db.<zone>.\(dnsDomain)); bare names work within a network via --dns-search.")
+            print("Note: In DNS-zone mode the container name is the FQDN, so 'container ls' shows full names and an explicit 'container_name' is also pulled into the project's zone (a deliberate deviation from docker-compose).")
         }
 
         // Filter for specified services, expanded with their transitive
@@ -172,16 +205,6 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
         // Stop Services
         try await stopOldStuff(services, remove: true)
-
-        // Process top-level networks
-        // This creates named networks defined in the docker-compose.yml
-        if let networks = dockerCompose.networks {
-            print("\n--- Processing Networks ---")
-            for (networkName, networkConfig) in networks {
-                try await setupNetwork(name: networkName, config: networkConfig)
-            }
-            print("--- Networks Processed ---\n")
-        }
 
         // Process top-level volumes
         // This creates native named volumes defined in the docker-compose.yml
@@ -290,7 +313,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private func getIPForRunningService(_ serviceName: String) async throws -> String? {
         guard let projectName else { return nil }
 
-        let containerName = containerNames[serviceName] ?? "\(projectName)-\(serviceName)"
+        let containerName = containerNames[serviceName] ?? resolveContainerName(
+            explicit: nil, projectName: projectName, serviceName: serviceName,
+            zone: serviceZones[serviceName], dnsDomain: dnsZoneDomain, envVars: environmentVariables)
 
         let client = ContainerClient()
         let container = try await client.get(id: containerName)
@@ -310,7 +335,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// - Returns: `true` if the container reached "running" state within the timeout.
     private func waitUntilServiceIsRunning(_ serviceName: String, timeout: TimeInterval = 30, interval: TimeInterval = 0.5) async throws {
         guard let projectName else { return }
-        let containerName = containerNames[serviceName] ?? "\(projectName)-\(serviceName)"
+        let containerName = containerNames[serviceName] ?? resolveContainerName(
+            explicit: nil, projectName: projectName, serviceName: serviceName,
+            zone: serviceZones[serviceName], dnsDomain: dnsZoneDomain, envVars: environmentVariables)
 
         let deadline = Date().addingTimeInterval(timeout)
         let client = ContainerClient()
@@ -333,9 +360,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private func stopOldStuff(_ services: [(serviceName: String, service: Service)], remove: Bool) async throws {
         guard let projectName else { return }
         // Respect explicit container_name (with variable interpolation), like ComposeDown does.
+        // Use the same zoned FQDN the containers were started with so the old
+        // ones are actually found and removed.
         let containers = services.map {
             resolveContainerName(
-                explicit: $0.service.container_name, projectName: projectName, serviceName: $0.serviceName, envVars: environmentVariables)
+                explicit: $0.service.container_name, projectName: projectName, serviceName: $0.serviceName,
+                zone: serviceZones[$0.serviceName], dnsDomain: dnsZoneDomain, envVars: environmentVariables)
         }
 
         for container in containers {
@@ -520,9 +550,10 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             runCommandArgs.append("-d")
         }
 
-        // Determine container name
+        // Determine container name (zoned FQDN when a DNS domain is configured)
         let containerName = resolveContainerName(
-            explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: environmentVariables)
+            explicit: service.container_name, projectName: projectName, serviceName: serviceName,
+            zone: serviceZones[serviceName], dnsDomain: dnsZoneDomain, envVars: environmentVariables)
         if service.container_name != nil {
             print("Info: Using explicit container_name: \(containerName)")
         }
@@ -602,6 +633,16 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             )
         } else {
             print("Note: Service '\(serviceName)' is not explicitly connected to any networks. It will likely use the default bridge network.")
+        }
+
+        // In DNS-zone mode, add the project's zone as a per-container search
+        // domain so bare service names (e.g. `db`) resolve to the project's
+        // FQDN (`db.<zone>.<domain>`) from inside the container. apple/container
+        // has no per-network embedded DNS or aliases, so this search domain is
+        // what scopes bare names to a project/network. Cross-project access
+        // still works via the full FQDN.
+        if let dnsDomain = dnsZoneDomain, let zone = serviceZones[serviceName], !zone.isEmpty {
+            runCommandArgs.append(contentsOf: ["--dns-search", "\(zone).\(dnsDomain)"])
         }
 
         // The 'hostname' field is not supported by `container run` (no --hostname
