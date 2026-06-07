@@ -22,6 +22,28 @@
 //
 
 
+/// IPAM (IP Address Management) configuration for a network.
+public struct Ipam: Codable {
+    /// IPAM driver (e.g., 'default')
+    public let driver: String?
+    /// IPAM configuration blocks
+    public let config: [Config]?
+    /// Driver-specific IPAM options
+    public let options: [String: String]?
+
+    /// A single IPAM configuration block.
+    public struct Config: Codable {
+        /// Subnet in CIDR format (e.g., '172.28.0.0/24')
+        public let subnet: String?
+        /// Range of IPs to allocate container IPs from
+        public let ip_range: String?
+        /// IPv4 or IPv6 gateway for the subnet
+        public let gateway: String?
+        /// Auxiliary IPv4 or IPv6 addresses used by the network driver
+        public let aux_addresses: [String: String]?
+    }
+}
+
 /// Represents a top-level network definition.
 public struct Network: Codable {
     /// Network driver (e.g., 'bridge', 'overlay')
@@ -40,10 +62,17 @@ public struct Network: Codable {
     public let name: String?
     /// Indicates if the network is external (pre-existing)
     public let external: ExternalNetwork?
+    /// IPAM configuration (subnets, gateways)
+    public let ipam: Ipam?
+
+    /// The first IPv4 subnet from the IPAM configuration, if any.
+    public var ipv4Subnet: String? {
+        ipam?.config?.compactMap(\.subnet).first { !$0.contains(":") }
+    }
 
     /// Updated CodingKeys to map 'internal' from YAML to 'isInternal' Swift property
     enum CodingKeys: String, CodingKey {
-        case driver, driver_opts, attachable, enable_ipv6, isInternal = "internal", labels, name, external
+        case driver, driver_opts, attachable, enable_ipv6, isInternal = "internal", labels, name, external, ipam
     }
 
     /// Custom initializer to handle `external: true` (boolean) or `external: { name: "my_net" }` (object).
@@ -56,6 +85,7 @@ public struct Network: Codable {
         isInternal = try container.decodeIfPresent(Bool.self, forKey: .isInternal) // Use isInternal here
         labels = try container.decodeIfPresent([String: String].self, forKey: .labels)
         name = try container.decodeIfPresent(String.self, forKey: .name)
+        ipam = try container.decodeIfPresent(Ipam.self, forKey: .ipam)
 
         if let externalBool = try? container.decodeIfPresent(Bool.self, forKey: .external) {
             external = ExternalNetwork(isExternal: externalBool, name: nil)

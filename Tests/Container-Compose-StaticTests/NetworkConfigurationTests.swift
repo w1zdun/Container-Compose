@@ -171,6 +171,100 @@ struct NetworkConfigurationTests {
         #expect(compose.services["web"]??.networks == nil)
     }
     
+    @Test("Parse network with ipam subnet")
+    func parseNetworkWithIpamSubnet() throws {
+        let yaml = """
+        ipam:
+          driver: default
+          config:
+            - subnet: 10.99.5.0/24
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        #expect(network.ipam?.driver == "default")
+        #expect(network.ipam?.config?.first?.subnet == "10.99.5.0/24")
+        #expect(network.ipv4Subnet == "10.99.5.0/24")
+    }
+
+    @Test("Parse network with full ipam config")
+    func parseNetworkWithFullIpamConfig() throws {
+        let yaml = """
+        ipam:
+          config:
+            - subnet: 172.28.0.0/16
+              ip_range: 172.28.5.0/24
+              gateway: 172.28.5.254
+              aux_addresses:
+                host1: 172.28.1.5
+          options:
+            foo: bar
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        let config = try #require(network.ipam?.config?.first)
+        #expect(config.subnet == "172.28.0.0/16")
+        #expect(config.ip_range == "172.28.5.0/24")
+        #expect(config.gateway == "172.28.5.254")
+        #expect(config.aux_addresses?["host1"] == "172.28.1.5")
+        #expect(network.ipam?.options?["foo"] == "bar")
+        #expect(network.ipv4Subnet == "172.28.0.0/16")
+    }
+
+    @Test("ipv4Subnet skips IPv6 subnets and picks first IPv4")
+    func ipv4SubnetSkipsIPv6() throws {
+        let yaml = """
+        ipam:
+          config:
+            - subnet: 2001:db8::/64
+            - subnet: 10.99.7.0/24
+            - subnet: 10.99.8.0/24
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        #expect(network.ipv4Subnet == "10.99.7.0/24")
+    }
+
+    @Test("Network without ipam has nil ipv4Subnet")
+    func networkWithoutIpam() throws {
+        let yaml = """
+        driver: bridge
+        """
+
+        let decoder = YAMLDecoder()
+        let network = try decoder.decode(Network.self, from: yaml)
+
+        #expect(network.ipam == nil)
+        #expect(network.ipv4Subnet == nil)
+    }
+
+    @Test("Parse compose with ipam network")
+    func parseComposeWithIpamNetwork() throws {
+        let yaml = """
+        version: '3.8'
+        services:
+          web:
+            image: nginx:latest
+            networks:
+              - backend
+        networks:
+          backend:
+            ipam:
+              config:
+                - subnet: 10.99.9.0/24
+        """
+
+        let decoder = YAMLDecoder()
+        let compose = try decoder.decode(DockerCompose.self, from: yaml)
+
+        #expect(compose.networks?["backend"]??.ipv4Subnet == "10.99.9.0/24")
+    }
+
     @Test("Empty networks definition")
     func emptyNetworksDefinition() throws {
         let yaml = """
