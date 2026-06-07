@@ -102,6 +102,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var projectName: String?
     private var environmentVariables: [String: String] = [:]
     private var namedVolumeNames: [String: String] = [:]  // compose volume key -> native volume name
+    private var containerNames: [String: String] = [:]  // service name -> resolved container name
     private var containerIps: [String: String] = [:]
     private var containerConsoleColors: [String: NamedColor] = [:]
 
@@ -159,7 +160,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
 
         // Stop Services
-        try await stopOldStuff(services.map({ $0.serviceName }), remove: true)
+        try await stopOldStuff(services, remove: true)
 
         // Process top-level networks
         // This creates named networks defined in the docker-compose.yml
@@ -274,7 +275,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private func getIPForRunningService(_ serviceName: String) async throws -> String? {
         guard let projectName else { return nil }
 
-        let containerName = "\(projectName)-\(serviceName)"
+        let containerName = containerNames[serviceName] ?? "\(projectName)-\(serviceName)"
 
         let client = ContainerClient()
         let container = try await client.get(id: containerName)
@@ -291,7 +292,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// - Returns: `true` if the container reached "running" state within the timeout.
     private func waitUntilServiceIsRunning(_ serviceName: String, timeout: TimeInterval = 30, interval: TimeInterval = 0.5) async throws {
         guard let projectName else { return }
-        let containerName = "\(projectName)-\(serviceName)"
+        let containerName = containerNames[serviceName] ?? "\(projectName)-\(serviceName)"
 
         let deadline = Date().addingTimeInterval(timeout)
         let client = ContainerClient()
@@ -311,9 +312,13 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             ])
     }
 
-    private func stopOldStuff(_ services: [String], remove: Bool) async throws {
+    private func stopOldStuff(_ services: [(serviceName: String, service: Service)], remove: Bool) async throws {
         guard let projectName else { return }
-        let containers = services.map { "\(projectName)-\($0)" }
+        // Respect explicit container_name (with variable interpolation), like ComposeDown does.
+        let containers = services.map {
+            resolveContainerName(
+                explicit: $0.service.container_name, projectName: projectName, serviceName: $0.serviceName, envVars: environmentVariables)
+        }
 
         for container in containers {
             print("Stopping container: \(container)")
@@ -471,14 +476,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
 
         // Determine container name
-        let containerName: String
-        if let explicitContainerName = service.container_name {
-            containerName = explicitContainerName
+        let containerName = resolveContainerName(
+            explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: environmentVariables)
+        if service.container_name != nil {
             print("Info: Using explicit container_name: \(containerName)")
-        } else {
-            // Default container name based on project and service name
-            containerName = "\(projectName)-\(serviceName)"
         }
+        containerNames[serviceName] = containerName
         runCommandArgs.append("--name")
         runCommandArgs.append(containerName)
 

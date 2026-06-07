@@ -82,6 +82,7 @@ public struct ComposeDown: AsyncParsableCommand {
 
     private var fileManager: FileManager { FileManager.default }
     private var projectName: String?
+    private var environmentVariables: [String: String] = [:]
 
     public mutating func run() async throws {
 
@@ -98,7 +99,7 @@ public struct ComposeDown: AsyncParsableCommand {
         let dockerCompose = try YAMLDecoder().decode(DockerCompose.self, from: dockerComposeString)
 
         // Load environment variables from .env file
-        let environmentVariables = loadEnvFile(path: envFilePath)
+        environmentVariables = loadEnvFile(path: envFilePath)
 
         // Determine project name for container naming
         let resolvedProjectName = resolveProjectName(
@@ -179,13 +180,9 @@ public struct ComposeDown: AsyncParsableCommand {
         guard let projectName else { return }
 
         for (serviceName, service) in services {
-            // Respect explicit container_name, otherwise use default pattern
-            let containerName: String
-            if let explicitContainerName = service.container_name {
-                containerName = explicitContainerName
-            } else {
-                containerName = "\(projectName)-\(serviceName)"
-            }
+            // Respect explicit container_name (with variable interpolation), otherwise use default pattern
+            let containerName = resolveContainerName(
+                explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: environmentVariables)
 
             print("Stopping container: \(containerName)")
             
