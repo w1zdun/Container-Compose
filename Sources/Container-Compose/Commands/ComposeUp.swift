@@ -25,6 +25,7 @@ import ArgumentParser
 import ContainerCommands
 //import ContainerClient
 import ContainerAPIClient
+import ContainerPersistence
 import ContainerizationExtras
 import Foundation
 @preconcurrency import Rainbow
@@ -102,6 +103,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var projectName: String?
     private var environmentVariables: [String: String] = [:]
     private var containerNames: [String: String] = [:]  // service name -> resolved container name
+    private var serviceHosts: [String: String] = [:]  // service name -> container DNS name (when a DNS domain is configured)
     private var containerIps: [String: String] = [:]
     private var containerConsoleColors: [String: NamedColor] = [:]
 
@@ -149,6 +151,17 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             return (serviceName, service)
         })
         services = try Service.topoSortConfiguredServices(services)
+
+        // Prefer DNS-based service resolution when the 'container' tool has a
+        // local DNS domain configured (container system dns create <domain> +
+        // container system property set dns.domain <domain>). DNS names are
+        // stable across restarts, unlike container IPs, and resolve even for
+        // services not (re)started by this invocation.
+        if let dnsDomain = DefaultsStore.getOptional(key: .defaultDNSDomain), !dnsDomain.isEmpty {
+            serviceHosts = buildServiceHosts(
+                services: services, projectName: projectName ?? "", dnsDomain: dnsDomain, envVars: environmentVariables)
+            print("Info: Local DNS domain '\(dnsDomain)' configured. Service references in environment values resolve to container DNS names.")
+        }
 
         // Filter for specified services
         if !self.services.isEmpty {
@@ -319,6 +332,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     // MARK: Compose Top Level Functions
 
     private mutating func updateEnvironmentWithServiceIP(_ serviceName: String) async throws {
+        // With DNS-based resolution the stable DNS name is substituted instead;
+        // recording the (less stable) IP here would override it.
+        guard serviceHosts.isEmpty else { return }
         let ip = try await getIPForRunningService(serviceName)
         self.containerIps[serviceName] = ip
         for (key, value) in environmentVariables.map({ ($0, $1) }) where value == serviceName {
@@ -497,9 +513,10 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             return combinedEnv[variableName] ?? value
         })
 
-        // Fill in IPs
+        // Resolve service references: prefer stable DNS names (when a local
+        // DNS domain is configured), fall back to recorded container IPs.
         combinedEnv = combinedEnv.mapValues({ value in
-            containerIps[value] ?? value
+            serviceHosts[value] ?? containerIps[value] ?? value
         })
 
         // MARK: Spinning Spot
