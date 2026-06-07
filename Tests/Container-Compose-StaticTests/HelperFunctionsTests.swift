@@ -387,6 +387,88 @@ struct ComposeVolumeTests {
         #expect(result == ["-v", "cache:/data"])
     }
 
+    @Test("Named volume nocopy mode is stripped from run args")
+    func testNamedVolumeNocopyStripped() throws {
+        let result = try composeVolumeToRunArgs(
+            "db_data:/var/lib/mysql:nocopy",
+            cwd: "/tmp",
+            namedVolumeNames: ["db_data": "myproj_db_data"]
+        )
+        #expect(result == ["-v", "myproj_db_data:/var/lib/mysql"])
+    }
+
+    @Test("Named volume keeps other modes when nocopy is stripped")
+    func testNamedVolumeNocopyStrippedKeepsRo() throws {
+        let result = try composeVolumeToRunArgs(
+            "db_data:/var/lib/mysql:ro,nocopy",
+            cwd: "/tmp",
+            namedVolumeNames: ["db_data": "myproj_db_data"]
+        )
+        #expect(result == ["-v", "myproj_db_data:/var/lib/mysql:ro"])
+    }
+
+    @Test("Bind mount mode is not rewritten", .tempDir)
+    func testBindMountModeUntouched() throws {
+        let tmp = TempDirTrait.current
+        let dataDir = tmp.appending(path: "data")
+        try FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+
+        let result = try composeVolumeToRunArgs("\(dataDir.path):/app/data:ro", cwd: tmp.path)
+        #expect(result == ["-v", "\(dataDir.path):/app/data:ro"])
+    }
+
+}
+
+@Suite("Named Volume Mount Parsing Tests")
+struct NamedVolumeMountsTests {
+
+    @Test("Named mounts are extracted with destination and native name")
+    func testNamedMountExtraction() {
+        let mounts = namedVolumeMounts(
+            volumes: ["db_data:/var/lib/mysql", "./local:/app", "nodest"],
+            namedVolumeNames: ["db_data": "myproj_db_data"]
+        )
+        #expect(mounts.count == 1)
+        #expect(mounts[0].nativeName == "myproj_db_data")
+        #expect(mounts[0].destination == "/var/lib/mysql")
+        #expect(mounts[0].nocopy == false)
+    }
+
+    @Test("nocopy mode is detected, alone and combined")
+    func testNocopyDetection() {
+        let mounts = namedVolumeMounts(
+            volumes: ["a:/data:nocopy", "b:/data:ro,nocopy", "c:/data:ro"],
+            namedVolumeNames: [:]
+        )
+        #expect(mounts.map(\.nocopy) == [true, true, false])
+    }
+
+    @Test("Variables in the entry are interpolated")
+    func testVariableInterpolation() {
+        let mounts = namedVolumeMounts(
+            volumes: ["${CC_TEST_VOL_UNSET:-db_data}:/var/lib/mysql"],
+            namedVolumeNames: ["db_data": "myproj_db_data"]
+        )
+        #expect(mounts.count == 1)
+        #expect(mounts[0].nativeName == "myproj_db_data")
+    }
+
+    @Test("Unmapped named source falls back to verbatim name")
+    func testUnmappedFallback() {
+        let mounts = namedVolumeMounts(volumes: ["cache:/data"], namedVolumeNames: [:])
+        #expect(mounts.count == 1)
+        #expect(mounts[0].nativeName == "cache")
+    }
+
+    @Test("Bind mounts and malformed entries yield nothing")
+    func testNonNamedEntriesSkipped() {
+        let mounts = namedVolumeMounts(
+            volumes: ["/abs:/data", "../rel:/data", "justone"],
+            namedVolumeNames: [:]
+        )
+        #expect(mounts.isEmpty)
+    }
+
 }
 
 @Suite("Named Volume Resolution Tests")

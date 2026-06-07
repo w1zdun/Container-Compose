@@ -371,12 +371,42 @@ func composeVolumeToRunArgs(
         // Named volume reference. Map the compose key to the native volume
         // name; the caller is responsible for creating the volume and seeding
         // the mapping. Fall back to the verbatim source if unmapped.
+        // `nocopy` is a compose-level signal (skip population from image
+        // content), not a runtime mount option — strip it before emitting.
         let nativeName = namedVolumeNames[source] ?? source
+        let runtimeMode = mode.flatMap { m -> String? in
+            let kept = m.split(separator: ",").filter { $0 != "nocopy" }
+            return kept.isEmpty ? nil : kept.joined(separator: ",")
+        }
         args.append("-v")
-        args.append(mountArg(source: nativeName))
+        if let runtimeMode {
+            args.append("\(nativeName):\(destination):\(runtimeMode)")
+        } else {
+            args.append("\(nativeName):\(destination)")
+        }
     }
 
     return args
+}
+
+/// Extracts the named-volume mounts from a service's `volumes:` entries, with
+/// the information the copy-on-first-use population step needs: the native
+/// volume name, the mount destination inside the container, and whether the
+/// compose entry opted out via `nocopy`. Bind mounts and malformed entries are
+/// skipped. Uses the same classification as `composeVolumeToRunArgs`.
+func namedVolumeMounts(
+    volumes: [String],
+    namedVolumeNames: [String: String],
+    environmentVariables: [String: String] = [:]
+) -> [(nativeName: String, destination: String, nocopy: Bool)] {
+    volumes.compactMap { volume in
+        let resolvedVolume = resolveVariable(volume, with: environmentVariables)
+        let components = resolvedVolume.split(separator: ":", maxSplits: 2).map(String.init)
+        guard components.count >= 2, isNamedVolumeSource(components[0]) else { return nil }
+        let nativeName = namedVolumeNames[components[0]] ?? components[0]
+        let nocopy = components.count == 3 && components[2].split(separator: ",").contains("nocopy")
+        return (nativeName, components[1], nocopy)
+    }
 }
 
 /// Converts the decoded `services:` mapping into a deterministically ordered
