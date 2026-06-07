@@ -446,13 +446,28 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 //                    }
             }
 
+            // Add IPAM subnet (first IPv4 subnet only; vmnet allocates automatically otherwise)
+            var createOptions: [String] = []
+            if let subnet = networkConfig?.ipv4Subnet {
+                createOptions.append(contentsOf: ["--subnet", subnet])
+                networkCreateArgs.append(contentsOf: ["--subnet", subnet])
+            }
+            if let ipamConfigs = networkConfig?.ipam?.config {
+                if ipamConfigs.contains(where: { $0.gateway != nil || $0.ip_range != nil || $0.aux_addresses != nil }) {
+                    print("Network IPAM gateway/ip_range/aux_addresses Detected, But Not Supported")
+                }
+                if ipamConfigs.contains(where: { $0.subnet?.contains(":") == true }) {
+                    print("Network IPAM IPv6 Subnet Detected, But Not Supported")
+                }
+            }
+
             print("Creating network: \(networkName) (Actual name: \(actualNetworkName))")
             print("Executing container network create: container \(networkCreateArgs.joined(separator: " "))")
             guard (try? await NetworkClient().get(id: actualNetworkName)) == nil else {
                 print("Network '\(networkName)' already exists")
                 return
             }
-            let commands = [actualNetworkName]
+            let commands = createOptions + [actualNetworkName]
             
             let networkCreate = try Application.NetworkCreate.parse(commands + logging.passThroughCommands())
 
