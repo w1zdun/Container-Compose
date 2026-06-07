@@ -111,16 +111,13 @@ public struct ComposeDown: AsyncParsableCommand {
         projectName = resolvedProjectName
         print("Info: Docker Compose project name resolved as: \(resolvedProjectName)")
 
-        var services: [(serviceName: String, service: Service)] = dockerCompose.services.compactMap({ serviceName, service in
-            guard let service else { return nil }
-            return (serviceName, service)
-        })
-        services = try Service.topoSortConfiguredServices(services)
+        var services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose.services))
 
-        // Filter for specified services
+        // Filter for specified services only (docker compose parity: `down app`
+        // does not touch app's dependencies).
         if !self.services.isEmpty {
-            services = services.filter({ serviceName, service in
-                self.services.contains(where: { $0 == serviceName }) || self.services.contains(where: { service.dependedBy.contains($0) })
+            services = services.filter({ serviceName, _ in
+                self.services.contains(serviceName)
             })
         }
 

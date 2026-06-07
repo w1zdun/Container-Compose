@@ -148,11 +148,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         )
 
         // Get Services to use
-        var services: [(serviceName: String, service: Service)] = dockerCompose.services.compactMap({ serviceName, service in
-            guard let service else { return nil }
-            return (serviceName, service)
-        })
-        services = try Service.topoSortConfiguredServices(services)
+        var services = try Service.topoSortConfiguredServices(configuredServices(from: dockerCompose.services))
 
         // Prefer DNS-based service resolution when the 'container' tool has a
         // local DNS domain configured (container system dns create <domain> +
@@ -165,11 +161,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("Info: Local DNS domain '\(dnsDomain)' configured. Service references in environment values resolve to container DNS names.")
         }
 
-        // Filter for specified services
+        // Filter for specified services, expanded with their transitive
+        // dependencies (docker compose parity: `up app` also starts what
+        // `app` depends on).
         if !self.services.isEmpty {
-            services = services.filter({ serviceName, service in
-                self.services.contains(where: { $0 == serviceName }) || self.services.contains(where: { service.dependedBy.contains($0) })
-            })
+            let selected = expandServiceSelection(requested: self.services, services: services)
+            services = services.filter({ selected.contains($0.serviceName) })
         }
 
         // Stop Services
