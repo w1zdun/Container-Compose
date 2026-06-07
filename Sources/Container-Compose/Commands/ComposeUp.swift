@@ -534,22 +534,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             }
         }
 
-        if let serviceEnv = service.environment {
-            combinedEnv.merge(serviceEnv) { (old, new) in
-                guard !new.contains("${") else {
-                    return old
-                }
-                return new
-            }  // Service env overrides .env files
-        }
-
-        // Fill in variables
-        combinedEnv = combinedEnv.mapValues({ value in
-            guard value.contains("${") else { return value }
-
-            let variableName = String(value.replacingOccurrences(of: "${", with: "").dropLast())
-            return combinedEnv[variableName] ?? value
-        })
+        // Service env overrides env files; its values are variable-interpolated
+        // per Compose semantics (e.g. SERVICE_ID=${SERVICE_ID:-12345}).
+        combinedEnv = mergeServiceEnvironment(base: combinedEnv, serviceEnvironment: service.environment, envVars: environmentVariables)
 
         // Resolve service references: prefer stable DNS names (when a local
         // DNS domain is configured), fall back to recorded container IPs.
