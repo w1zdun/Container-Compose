@@ -102,6 +102,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     private var projectName: String?
     private var environmentVariables: [String: String] = [:]
     private var namedVolumeNames: [String: String] = [:]  // compose volume key -> native volume name
+    private var freshlyCreatedVolumes: Set<String> = []  // native names created by this run, pending population
     private var containerIps: [String: String] = [:]
     private var containerConsoleColors: [String: NamedColor] = [:]
 
@@ -182,7 +183,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                     print("Info: Volume '\(volumeKey)' is declared as external. Assuming '\(nativeName)' already exists; it will not be created.")
                     continue
                 }
-                try await createNamedVolume(key: volumeKey, name: nativeName, config: volumeConfig, existing: existingVolumes)
+                if try await createNamedVolume(key: volumeKey, name: nativeName, config: volumeConfig, existing: existingVolumes) {
+                    freshlyCreatedVolumes.insert(nativeName)
+                }
             }
         }
 
@@ -198,7 +201,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 let (nativeName, _) = resolveNamedVolume(key: source, config: nil, projectName: projectName ?? "")
                 print("Info: Volume '\(source)' is referenced by a service but not declared top-level. Creating '\(nativeName)'.")
                 namedVolumeNames[source] = nativeName
-                try await createNamedVolume(key: source, name: nativeName, config: nil, existing: existingVolumes)
+                if try await createNamedVolume(key: source, name: nativeName, config: nil, existing: existingVolumes) {
+                    freshlyCreatedVolumes.insert(nativeName)
+                }
             }
         }
         print("--- Volumes Processed ---\n")
@@ -347,10 +352,14 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
     }
 
-    private func createNamedVolume(key: String, name: String, config: Volume?, existing: Set<String>) async throws {
+    /// Creates the native volume unless it already exists.
+    /// - Returns: `true` when this call actually created the volume (it is
+    ///   fresh and empty, eligible for population from image content).
+    @discardableResult
+    private func createNamedVolume(key: String, name: String, config: Volume?, existing: Set<String>) async throws -> Bool {
         guard !existing.contains(name) else {
             print("Volume '\(key)' (\(name)) already exists")
-            return
+            return false
         }
         print("Creating volume: \(key) (Actual name: \(name))")
         do {
@@ -361,11 +370,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 labels: config?.labels ?? [:]
             )
             print("Volume '\(key)' created")
+            return true
         } catch {
             // Tolerate races with the pre-check: an already-existing volume is success.
             if (try? await ClientVolume.inspect(name)) != nil {
                 print("Volume '\(key)' (\(name)) already exists")
-                return
+                return false
             }
             throw error
         }
@@ -452,7 +462,11 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // Should not happen due to Service init validation, but as a fallback
             throw ComposeError.imageNotFound(serviceName)
         }
-        
+
+        // Populate freshly created named volumes from the image's content at
+        // the mount destination (docker copy-on-first-use parity).
+        await populateNamedVolumes(for: service, serviceName: serviceName, image: imageToRun, platform: service.platform)
+
         // Set Run Platform
         if let platform = service.platform {
             runCommandArgs.append(contentsOf: ["--platform", "\(platform)"])
@@ -775,6 +789,57 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
     private func configVolume(_ volume: String) async throws -> [String] {
         try composeVolumeToRunArgs(volume, cwd: cwd, fileManager: fileManager, environmentVariables: environmentVariables, namedVolumeNames: namedVolumeNames)
+    }
+
+    /// Docker parity: when a named volume is created and the image has content
+    /// at the mount destination, that content is copied into the volume before
+    /// first use (unless the entry opts out with `nocopy`). Apple's container
+    /// runtime does not do this, so it is emulated with a one-shot container:
+    /// the volume is mounted at a temporary path (leaving the destination
+    /// unshadowed) and the image's own shell copies the destination's content
+    /// over. Only volumes created by this run are populated, and only once —
+    /// the first service to use a volume wins, as in docker.
+    ///
+    /// Never throws: an image without a shell (e.g. distroless) cannot
+    /// populate, which degrades to the previous behavior (empty volume) with a
+    /// warning; the volume stays eligible so a later service whose image has a
+    /// shell may still populate it.
+    private mutating func populateNamedVolumes(for service: Service, serviceName: String, image: String, platform: String?) async {
+        guard !freshlyCreatedVolumes.isEmpty, let volumes = service.volumes else { return }
+
+        for mount in namedVolumeMounts(volumes: volumes, namedVolumeNames: namedVolumeNames, environmentVariables: environmentVariables) {
+            guard freshlyCreatedVolumes.contains(mount.nativeName) else { continue }
+            if mount.nocopy {
+                print("Info: Volume '\(mount.nativeName)' is mounted with 'nocopy'; skipping population from image content.")
+                continue
+            }
+
+            print("Populating volume '\(mount.nativeName)' from image content at '\(mount.destination)' (service: \(serviceName))...")
+            let populateMount = "/__compose-populate"
+            let script = "if [ -d \"\(mount.destination)\" ]; then cp -a \"\(mount.destination)/.\" \(populateMount)/; fi"
+            var args = ["run", "--rm", "--entrypoint", "sh", "-v", "\(mount.nativeName):\(populateMount)"]
+            if let platform {
+                args.append(contentsOf: ["--platform", platform])
+            }
+            args.append(contentsOf: [image, "-c", script])
+
+            do {
+                let exitCode = try await streamCommand(
+                    "container", args: args,
+                    onStdout: { print("\(serviceName) [populate]: \($0)") },
+                    onStderr: { print("\(serviceName) [populate]: \($0)") })
+                if exitCode == 0 {
+                    print("Volume '\(mount.nativeName)' populated.")
+                    freshlyCreatedVolumes.remove(mount.nativeName)
+                } else {
+                    print(
+                        "Warning: Could not populate volume '\(mount.nativeName)' from image '\(image)' (exit code \(exitCode)). The image may not contain a shell. The service will start with an empty volume."
+                    )
+                }
+            } catch {
+                print("Warning: Could not populate volume '\(mount.nativeName)' from image '\(image)': \(error). The service will start with an empty volume.")
+            }
+        }
     }
 }
 
