@@ -203,6 +203,24 @@ func shellLex(_ input: String) -> [String] {
     return args
 }
 
+/// Builds a service-name -> DNS host mapping (`<containerName>.<domain>`) for
+/// the given services, used to resolve inter-service references in environment
+/// values when the 'container' tool has a local DNS domain configured.
+func buildServiceHosts(
+    services: [(serviceName: String, service: Service)],
+    projectName: String,
+    dnsDomain: String,
+    envVars: [String: String] = [:]
+) -> [String: String] {
+    var hosts: [String: String] = [:]
+    for (serviceName, service) in services {
+        let containerName = resolveContainerName(
+            explicit: service.container_name, projectName: projectName, serviceName: serviceName, envVars: envVars)
+        hosts[serviceName] = "\(containerName).\(dnsDomain)"
+    }
+    return hosts
+}
+
 /// Converts Docker Compose port specification into a container run -p format.
 /// Handles various formats: "PORT", "HOST:PORT", "IP:HOST:PORT", and optional protocol.
 /// - Parameter portSpec: The port specification string from docker-compose.yml.

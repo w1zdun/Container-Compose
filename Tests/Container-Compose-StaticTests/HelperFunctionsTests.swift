@@ -97,6 +97,19 @@ struct HelperFunctionsTests {
         #expect(result == "myproj-web")
     }
 
+    @Test("Service hosts map to container DNS names")
+    func testBuildServiceHosts() throws {
+        let services: [(serviceName: String, service: Service)] = [
+            ("db", Service(image: "mysql:8")),
+            ("web", Service(image: "nginx", container_name: "my-web")),
+            ("worker", Service(image: "alpine", container_name: "${CC_TEST_WORKER_UNSET:-worker-dev}")),
+        ]
+        let hosts = buildServiceHosts(services: services, projectName: "myproj", dnsDomain: "dev")
+        #expect(hosts["db"] == "myproj-db.dev")
+        #expect(hosts["web"] == "my-web.dev")
+        #expect(hosts["worker"] == "worker-dev.dev")
+    }
+
     @Test("Resolve explicit relative paths against base URL")
     func testResolvedPathRelativeSegments() throws {
         let baseURL = URL(fileURLWithPath: "/tmp/project/compose/compose.yml").deletingLastPathComponent()
